@@ -26,6 +26,9 @@
 #include "scsi.h"
 #include "config.h"
 #include "inquiry.h"
+#ifdef ZULUSCSI_NETWORK
+#include "network.h"
+#endif
 #include <ZuluSCSI_config.h>
 #include <custom_vendor_inquiry.h>
 #include <string.h>
@@ -327,6 +330,19 @@ uint32_t s2s_getStandardInquiry(
 		out[4] = 0x1f + (sizeof(INQUIRY_NAME) - 1)
 		              + 1; // PLATFORM_TOOLBOX_API
 	}
+#ifdef ZULUSCSI_NETWORK
+	/* The DaynaPORT answers 37 bytes: byte 36 is live status, 0x80
+	 * enabled and 0x40 mode set (ROM 0x1500, 0x150e), plus the
+	 * extension capability bits a host probes before using them.
+	 * Appended here because scsi.c answers INQUIRY before any
+	 * personality runs. */
+	else if (cfg->deviceType == S2S_CFG_NETWORK && size < maxlen) {
+		out[size++] = scsiNetworkInquiryStatus();
+		/* Keep the additional-length byte in step: a host reads 5
+		 * bytes, then re-issues for 4 + 1 + out[4]. */
+		out[4] = (uint8_t)(size - 5);
+	}
+#endif
 	return size;
 }
 

@@ -18,6 +18,7 @@
 #define NETWORK_H
 #ifdef ZULUSCSI_NETWORK
 #include <sys/types.h>
+#include <stdbool.h>
 #include "AmigaWIFI/AmigaWIFI.h"
 #include "crc32_ethernet.h"
 
@@ -69,7 +70,16 @@ struct __attribute__((packed)) wifi_join_request {
 #define SCSI_NETWORK_WIFI_CMD_INFO			0x04
 #define SCSI_NETWORK_WIFI_CMD_JOIN			0x05
 
-int scsiNetworkCommand(void);
+/* Defined in network.c; the DaynaPort personality drives both. */
+extern struct scsiNetworkPacketQueue scsiNetworkInboundQueue;
+extern bool scsiNetworkEnabled;
+extern uint32_t scsiNetworkMissed;
+
+int scsiNetworkCommand(void);        /* DaynaPort/DaynaPort.c */
+int scsiNetworkWifiCommand(void);    /* the WiFi extension, network.c */
+
+/* INQUIRY byte 36: the SL003 extension capability bits. */
+uint8_t scsiNetworkInquiryStatus(void);
 int scsiNetworkEnqueue(const uint8_t *buf, size_t len);
 
 // Shared WiFi subcommand handlers (used by both DaynaPort and AmigaWIFI)

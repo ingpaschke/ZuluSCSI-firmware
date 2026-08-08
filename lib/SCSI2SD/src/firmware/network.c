@@ -28,6 +28,9 @@ extern int platform_network_send(uint8_t *buf, size_t len);
 
 bool scsiNetworkEnabled = false;
 struct scsiNetworkPacketQueue scsiNetworkInboundQueue;
+/* Frames the radio delivered that the ring had no room for; the
+ * DaynaPORT statistics command reports and clears them. */
+uint32_t scsiNetworkMissed = 0;
 
 struct __attribute__((packed)) wifi_network_entry wifi_network_list[WIFI_NETWORK_LIST_ENTRY_COUNT] = { 0 };
 
@@ -154,263 +157,37 @@ void scsiNetworkWifiJoin(uint32_t size)
 	scsiDev.phase = STATUS;
 }
 
-int scsiNetworkCommand()
+/*
+ * The DaynaPORT protocol itself now lives in DaynaPort/sl003_core.c,
+ * built from the Dayna SL003 v2.0 ROM disassembly and shared with the
+ * BlueSCSI-SL003 fork; DaynaPort/DaynaPort.c drives it over this
+ * platform's bus and owns scsiNetworkCommand().
+ *
+ * What stays here is the ZuluSCSI WiFi extension: several
+ * configuration commands sharing one vendor opcode, with the
+ * sub-command in CDB[1]. Each helper sets the data phase itself.
+ */
+int scsiNetworkWifiCommand(void)
 {
-	int parityError, done, idx, total;
-	long len;
 	uint32_t size = (scsiDev.cdb[3] << 8) + scsiDev.cdb[4];
-	uint8_t command = scsiDev.cdb[0];
 
-	DBGMSG_F("------ in scsiNetworkCommand with command 0x%02x (size %d)", command, size);
+	DBGMSG_F("------ wi-fi command 0x%02x (size %d)", scsiDev.cdb[1], size);
 
-	switch (command) {
-	case 0x08:
-	{
-		// read(6)
-		// CDB[5] bit 6 indicates transfer mode from the host driver:
-		//   0x80 (bit 6 clear) = polled mode (old SCSI Manager, VM present) -> single packet
-		//   0xC0 (bit 6 set)   = blind mode (new SCSI Manager, no VM) -> multi-packet OK
-		// When bit 6 is clear, we send only one packet per READ(6) to minimize SCSI bus
-		// hold time, allowing the VM pager to access the bus between transactions.
-
-		int multiPacket = (scsiDev.cdb[5] & 0x40) != 0;
-		if (unlikely(size == 1))
-		{
-			scsiDev.status = CHECK_CONDITION;
-			scsiDev.phase = STATUS;
-			break;
-		}
-
-		// if we have nothing to send, just return early
-		if (scsiNetworkInboundQueue.readIndex == scsiNetworkInboundQueue.writeIndex)
-		{
-			memset(scsiDev.data, 0, 6);
-			scsiEnterPhase(DATA_IN);
-			scsiWrite(scsiDev.data, 6);
-			while (!scsiIsWriteFinished(NULL))
-			{
-				platform_poll();
-			}
-			scsiFinishWrite();
-			scsiDev.status = GOOD;
-			scsiDev.phase = STATUS;
-			break;
-		}
-
-		scsiEnterPhase(DATA_IN);
-
-		for (done = 0, total = 0; !done; )
-		{
-			idx = scsiNetworkInboundQueue.readIndex;
-			len = scsiNetworkInboundQueue.sizes[idx];
-			total += len + 6;  // packet data + 6-byte header;
-
-			if (scsiNetworkInboundQueue.readIndex == NETWORK_PACKET_QUEUE_SIZE - 1)
-			{
-				scsiNetworkInboundQueue.readIndex = 0;
-			}
-			else
-			{
-				scsiNetworkInboundQueue.readIndex++;
-			}
-
-			done = (scsiNetworkInboundQueue.readIndex == scsiNetworkInboundQueue.writeIndex);
-
-		// In polled mode (bit 6 clear), only send one packet per READ(6)
-			// to avoid holding the SCSI bus while the VM pager needs it.
-			if (!done && !multiPacket)
-			{
-				done = 1;
-			}
-
-			// Don't exceed the transfer size requested by the host
-			if (!done && total + DAYNAPORT_SCSI_PACKET_MAX + 6 > size)
-			{
-				done = 1;
-			}
-
-			// Don't tie up the SCSI bus too long even in multi-packet mode
-			if (!done && total >= (DAYNAPORT_SCSI_PACKET_MAX + 6) * 2)
-			{
-				done = 1;
-			}
-
-			scsiDev.data[0] = (len >> 8) & 0xff;
-			scsiDev.data[1] = len & 0xff;
-			scsiDev.data[2] = 0;
-			scsiDev.data[3] = 0;
-			scsiDev.data[4] = 0;
-			scsiDev.data[5] = (done ? 0 : 0x10);
-
-			scsiWrite(scsiDev.data, 6);
-			while (!scsiIsWriteFinished(NULL))
-			{
-				platform_poll();
-			}
-			scsiFinishWrite();
-
-			// DaynaPort Mac driver needs a short delay after reading size and flags.
-			// Timing matches real DaynaPORT SCSI/Link-3 behavior observed on a SCSI bus analyzer.
-			sleep_us(75);
-
-			scsiWrite(scsiNetworkInboundQueue.packets[idx], len);
-			while (!scsiIsWriteFinished(NULL))
-			{
-				platform_poll();
-			}
-			scsiFinishWrite();
-
-			if (!done)
-			{
-				// DaynaPort Mac driver needs a delay between packets.
-				// Timing matches real DaynaPORT SCSI/Link-3 behavior observed on a SCSI bus analyzer.
-				sleep_us(300);
-			}
-		}
-
-		scsiDev.status = GOOD;
-		scsiDev.phase = STATUS;
+	switch (scsiDev.cdb[1]) {
+	case SCSI_NETWORK_WIFI_CMD_SCAN:
+		scsiNetworkWifiScan();
 		break;
-	}
-
-	case 0x09:
-		// read mac address and stats
-		memcpy(scsiDev.data, scsiDev.boardCfg.wifiMACAddress, sizeof(scsiDev.boardCfg.wifiMACAddress));
-		memset(scsiDev.data + sizeof(scsiDev.boardCfg.wifiMACAddress), 0,
-			sizeof(scsiDev.data) - sizeof(scsiDev.boardCfg.wifiMACAddress));
-
-		// three 32-bit counters expected to follow, just return zero for all
-		scsiDev.dataLen = 18;
-		scsiDev.phase = DATA_IN;
+	case SCSI_NETWORK_WIFI_CMD_COMPLETE:
+		scsiNetworkWifiComplete();
 		break;
-
-	case 0x0a:
-		// write(6)
-		scsiEnterPhase(DATA_OUT);
-
-		for (;;)
-		{
-			if (scsiDev.cdb[5] == 0x0)
-			{
-				// no preamble, single packet
-				len = size;
-				DBGMSG_F("no-preamble write, size %ld (cdb %02x %02x %02x %02x %02x %02x)", len,
-					scsiDev.cdb[0], scsiDev.cdb[1], scsiDev.cdb[2], scsiDev.cdb[3], scsiDev.cdb[4], scsiDev.cdb[5]);
-			}
-			else
-			{
-				// read size of this packet
-				scsiRead(scsiDev.data, 4, &parityError);
-				if (parityError)
-				{
-					DBGMSG_F("%s: read of size from host had parity error %d", __func__, parityError);
-				}
-
-				len = (scsiDev.data[0] << 8) + scsiDev.data[1];
-				if (len == 0)
-				{
-					// final packet was read in previous iteration
-					break;
-				}
-			}
-
-			if (len > NETWORK_PACKET_MAX_SIZE)
-			{
-				DBGMSG_F("%s: attempt to write(6) packet of size %zu", __func__, len);
-				len = NETWORK_PACKET_MAX_SIZE;
-			}
-
-			scsiRead(scsiDev.data, len, &parityError);
-			if (parityError)
-			{
-				DBGMSG_F("%s: read from host of size %zu had parity error %d", __func__, size, parityError);
-			}
-
-			platform_network_send(scsiDev.data, len);      
-
-			if (scsiDev.cdb[5] == 0x0)
-			{
-				// single-packet mode
-				break;
-			}
-		}
-
-		scsiDev.status = GOOD;
-		scsiDev.phase = STATUS;
+	case SCSI_NETWORK_WIFI_CMD_SCAN_RESULTS:
+		scsiNetworkWifiScanResults(size);
 		break;
-
-	case 0x0c:
-		// set interface mode (ignored)
-		//broadcasts = (scsiDev.cdb[4] == 0x04);
+	case SCSI_NETWORK_WIFI_CMD_INFO:
+		scsiNetworkWifiInfo();
 		break;
-
-	case 0x0d:
-		// add multicast addr to network filter
-		memset(scsiDev.data, 0, sizeof(scsiDev.data));
-		scsiEnterPhase(DATA_OUT);
-		parityError = 0;
-		scsiRead(scsiDev.data, size, &parityError);
-
-		DBGMSG_F("%s: adding multicast address %02x:%02x:%02x:%02x:%02x:%02x", __func__,
-			  scsiDev.data[0], scsiDev.data[1], scsiDev.data[2], scsiDev.data[3], scsiDev.data[4], scsiDev.data[5]);
-
-
-		platform_network_add_multicast_address(scsiDev.data);
-
-		scsiDev.status = GOOD;
-		scsiDev.phase = STATUS;
-		break;
-
-	case 0x0e:
-		// toggle interface
-		if (scsiDev.cdb[5] & 0x80)
-		{
-			DBGMSG_F("%s: enable interface", __func__);
-			scsiNetworkEnabled = true;
-			memset(&scsiNetworkInboundQueue, 0, sizeof(scsiNetworkInboundQueue));
-		}
-		else
-		{
-			DBGMSG_F("%s: disable interface", __func__);
-			scsiNetworkEnabled = false;
-		}
-		break;
-
-	case 0x1a:
-		// mode sense (ignored)
-		break;
-
-	case 0x40:
-		// set MAC (ignored)
-		scsiDev.dataLen = 6;
-		scsiDev.phase = DATA_OUT;
-		break;
-
-	case 0x80:
-		// set mode (ignored)
-		break;
-
-	// custom wifi commands all using the same opcode, with a sub-command in cdb[2]
-	case SCSI_NETWORK_WIFI_CMD:
-		DBGMSG_F("------ in scsiNetworkCommand with wi-fi command 0x%02x (size %d)", scsiDev.cdb[2], size);
-
-		switch (scsiDev.cdb[1]) {
-		case SCSI_NETWORK_WIFI_CMD_SCAN:
-			scsiNetworkWifiScan();
-			break;
-		case SCSI_NETWORK_WIFI_CMD_COMPLETE:
-			scsiNetworkWifiComplete();
-			break;
-		case SCSI_NETWORK_WIFI_CMD_SCAN_RESULTS:
-			scsiNetworkWifiScanResults(size);
-			break;
-		case SCSI_NETWORK_WIFI_CMD_INFO:
-			scsiNetworkWifiInfo();
-			break;
-		case SCSI_NETWORK_WIFI_CMD_JOIN:
-			scsiNetworkWifiJoin(size);
-			break;
-		}
+	case SCSI_NETWORK_WIFI_CMD_JOIN:
+		scsiNetworkWifiJoin(size);
 		break;
 	}
 
@@ -419,6 +196,8 @@ int scsiNetworkCommand()
 
 int scsiNetworkEnqueue(const uint8_t *buf, size_t len)
 {
+	uint8_t nextWriteIndex;
+
 	if (!scsiNetworkEnabled)
 		return 0;
 
@@ -444,15 +223,25 @@ int scsiNetworkEnqueue(const uint8_t *buf, size_t len)
 
 	scsiNetworkInboundQueue.sizes[scsiNetworkInboundQueue.writeIndex] = len + 4;
 
-	if (scsiNetworkInboundQueue.writeIndex == NETWORK_PACKET_QUEUE_SIZE - 1)
-		scsiNetworkInboundQueue.writeIndex = 0;
-	else
-		scsiNetworkInboundQueue.writeIndex++;
+	/*
+	 * Publish only if a slot remains. Letting writeIndex land on
+	 * readIndex makes a full ring read as an EMPTY one, so the whole
+	 * backlog goes missing at once and the slot the consumer is reading
+	 * from is the next one overwritten. Drop the newest frame instead
+	 * and count it: Ethernet may lose a frame, but the queue must not
+	 * lose the ones already in it.
+	 */
+	nextWriteIndex = (scsiNetworkInboundQueue.writeIndex == NETWORK_PACKET_QUEUE_SIZE - 1)
+	               ? 0 : (uint8_t)(scsiNetworkInboundQueue.writeIndex + 1);
 
-	if (scsiNetworkInboundQueue.writeIndex == scsiNetworkInboundQueue.readIndex)
+	if (nextWriteIndex == scsiNetworkInboundQueue.readIndex)
 	{
-		DBGMSG_F("%s: dropping packets in ring, write index caught up to read index", __func__);
+		DBGMSG_F("%s: receive ring full, dropping frame", __func__);
+		scsiNetworkMissed++;
+		return 0;
 	}
+
+	scsiNetworkInboundQueue.writeIndex = nextWriteIndex;
 
 	return 1;
 }
